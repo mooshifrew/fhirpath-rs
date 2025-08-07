@@ -5,6 +5,7 @@ use crate::registry::function::{
     EvaluationContext, FhirPathFunction, FunctionError, FunctionResult,
 };
 use crate::registry::signature::FunctionSignature;
+use serde_json::Value;
 
 /// resolve() function - resolves FHIR references to resources
 ///
@@ -60,12 +61,8 @@ impl FhirPathFunction for ResolveFunction {
         };
 
         for item in items {
-            match self.resolve_item(item, context) {
-                Some(resolved) => resolved_resources.push(resolved),
-                None => {
-                    // Item cannot be resolved - ignore it as per spec
-                    continue;
-                }
+            if let Some(resolved) = self.resolve_item(item, context) {
+                resolved_resources.push(resolved);
             }
         }
 
@@ -89,24 +86,20 @@ impl ResolveFunction {
                 if self.is_reference(resource) {
                     self.resolve_reference_resource(resource, context)
                 } else {
-                    // Not a reference - ignore
                     None
                 }
             }
 
-            // Other types cannot be resolved
             _ => None,
         }
     }
 
     /// Check if a resource is a Reference type
     fn is_reference(&self, resource: &FhirResource) -> bool {
-        // Check if this is a Reference resource by looking for 'reference' field
-        if let Some(obj) = resource.as_json().as_object() {
-            obj.contains_key("reference")
-        } else {
-            false
-        }
+        resource
+            .as_json()
+            .as_object()
+            .map_or(false, |obj| obj.contains_key("reference"))
     }
 
     /// Resolve a Reference resource by extracting its reference field
@@ -115,14 +108,9 @@ impl ResolveFunction {
         resource: &FhirResource,
         context: &EvaluationContext,
     ) -> Option<FhirPathValue> {
-        if let Some(obj) = resource.as_json().as_object() {
-            if let Some(reference_value) = obj.get("reference") {
-                if let Some(reference_str) = reference_value.as_str() {
-                    return self.resolve_string_reference(reference_str, context);
-                }
-            }
-        }
-        None
+        let obj = resource.as_json().as_object()?;
+        let reference_str = obj.get("reference")?.as_str()?;
+        self.resolve_string_reference(reference_str, context)
     }
 
     /// Resolve a string reference (URI/URL)
@@ -131,29 +119,175 @@ impl ResolveFunction {
         reference: &str,
         context: &EvaluationContext,
     ) -> Option<FhirPathValue> {
-        // Handle fragment references to contained resources (e.g., "#obs1")
-        if let Some(contained_id) = reference.strip_prefix('#') {
-            // Remove the '#' prefix
+        // Trim whitespace and skip anything that doesn’t look like a FHIR reference
+        let ref_str = reference.trim();
+        if !ref_str.starts_with('#') && !self.is_fhir_reference(ref_str) {
+            return None;
+        }
+
+        // 1. Fragment to contained resource
+        if let Some(contained_id) = ref_str.strip_prefix('#') {
             return self.resolve_contained_resource(contained_id, context);
         }
 
-        // In a real implementation, this would:
-        // 1. Parse the reference to determine if it's relative or absolute
-        // 2. Look up the referenced resource from a bundle, server, or context
-        // 3. Return the resolved resource
+        // Helpers ----------------------------------------------------------------
 
-        // For now, we'll implement a basic stub that:
-        // - Returns a placeholder resource for demonstration
-        // - In practice, this would need access to a FHIR server/bundle resolver
+        // Parse "Type/ID" from references like "Patient/123" or full URLs.
+        fn parse_reference_type_id(reference: &str) -> Option<(String, String)> {
+            let parts: Vec<&str> = reference.split('/').collect();
+            if parts.len() < 2 {
+                return None;
+            }
+            let (t, raw_id) = (
+                parts[parts.len() - 2],
+                parts[parts.len() - 1]
+                    .split(|c| c == '?' || c == '#')
+                    .next()
+                    .unwrap_or(""),
+            );
+            Some((t.to_string(), raw_id.to_string()))
+        }
 
-        // Check if it looks like a FHIR reference
-        if self.is_fhir_reference(reference) {
-            // Create a placeholder resource - in a real implementation this would
-            // fetch the actual resource from a server or bundle
-            self.create_placeholder_resource(reference)
-        } else {
+        // Search entries in a Bundle
+        fn resolve_in_bundle(reference: &str, bundle: &FhirResource) -> Option<FhirPathValue> {
+            let bundle_json = bundle.as_json();
+            let entries = bundle_json.get("entry")?.as_array()?;
+
+            // Fast path: fullUrl match
+            for entry in entries {
+                if let Some(full_url) = entry.get("fullUrl").and_then(|v| v.as_str()) {
+                    if full_url == reference {
+                        let r = entry.get("resource")?.clone();
+                        return Some(FhirPathValue::Resource(FhirResource::from_json(r)));
+                    }
+                }
+            }
+
+            // Parse type/id
+            if let Some((ref_type, ref_id)) = parse_reference_type_id(reference) {
+                // Match resourceType/id
+                for entry in entries {
+                    let res = entry.get("resource")?;
+                    let obj = res.as_object()?;
+                    if obj.get("resourceType")?.as_str()? == ref_type
+                        && obj.get("id")?.as_str()? == ref_id
+                    {
+                        return Some(FhirPathValue::Resource(FhirResource::from_json(
+                            res.clone(),
+                        )));
+                    }
+                }
+                // Fallback: parse on fullUrl tail
+                for entry in entries {
+                    if let Some(full_url) = entry.get("fullUrl").and_then(|v| v.as_str()) {
+                        if let Some((t, id)) = parse_reference_type_id(full_url) {
+                            if t == ref_type && id == ref_id {
+                                let r = entry.get("resource")?.clone();
+                                return Some(FhirPathValue::Resource(FhirResource::from_json(r)));
+                            }
+                        }
+                    }
+                }
+            }
+
             None
         }
+
+        // Search entries in a Parameters resource
+        fn resolve_in_parameters(
+            reference: &str,
+            parameters: &FhirResource,
+        ) -> Option<FhirPathValue> {
+            let params = parameters.as_json().get("parameter")?.as_array()?;
+            if let Some((ref_type, ref_id)) = parse_reference_type_id(reference) {
+                // Recursively search `parameter` and nested `part`
+                fn search_params(
+                    array: &[Value],
+                    r_type: &str,
+                    r_id: &str,
+                ) -> Option<FhirPathValue> {
+                    for param in array {
+                        if let Some(res) = param.get("resource") {
+                            let obj = res.as_object()?;
+                            if obj.get("resourceType")?.as_str()? == r_type
+                                && obj.get("id")?.as_str()? == r_id
+                            {
+                                return Some(FhirPathValue::Resource(FhirResource::from_json(
+                                    res.clone(),
+                                )));
+                            }
+                        }
+                        if let Some(parts) = param.get("part").and_then(|v| v.as_array()) {
+                            if let Some(found) = search_params(parts, r_type, r_id) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                    None
+                }
+                return search_params(params, &ref_type, &ref_id);
+            }
+            None
+        }
+
+        // Check the root resource itself
+        fn resolve_against_resource(
+            reference: &str,
+            resource: &FhirResource,
+        ) -> Option<FhirPathValue> {
+            if let Some((ref_type, ref_id)) = parse_reference_type_id(reference) {
+                if resource.resource_type()? == ref_type {
+                    let obj = resource.as_json().as_object()?;
+                    if obj.get("id")?.as_str()? == ref_id {
+                        return Some(FhirPathValue::Resource(resource.clone()));
+                    }
+                }
+            }
+            None
+        }
+
+        // Main resolution against context.root -----------------------------------
+        match &context.root {
+            FhirPathValue::Resource(root_res) => {
+                if let Some(rt) = root_res.resource_type() {
+                    if rt == "Bundle" {
+                        if let Some(found) = resolve_in_bundle(ref_str, root_res) {
+                            return Some(found);
+                        }
+                    } else if rt == "Parameters" {
+                        if let Some(found) = resolve_in_parameters(ref_str, root_res) {
+                            return Some(found);
+                        }
+                    }
+                }
+                if let Some(found) = resolve_against_resource(ref_str, root_res) {
+                    return Some(found);
+                }
+            }
+            FhirPathValue::Collection(coll) => {
+                for val in coll.iter() {
+                    if let FhirPathValue::Resource(res) = val {
+                        if let Some(rt) = res.resource_type() {
+                            if rt == "Bundle" {
+                                if let Some(found) = resolve_in_bundle(ref_str, res) {
+                                    return Some(found);
+                                }
+                            } else if rt == "Parameters" {
+                                if let Some(found) = resolve_in_parameters(ref_str, res) {
+                                    return Some(found);
+                                }
+                            }
+                        }
+                        if let Some(found) = resolve_against_resource(ref_str, res) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        None
     }
 
     /// Resolve a contained resource by ID
@@ -162,33 +296,20 @@ impl ResolveFunction {
         id: &str,
         context: &EvaluationContext,
     ) -> Option<FhirPathValue> {
-        // Get the root resource from context
-        if let FhirPathValue::Resource(root_resource) = &context.root {
-            if let Some(root_obj) = root_resource.as_json().as_object() {
-                // Look for 'contained' array
-                if let Some(contained_array) = root_obj.get("contained") {
-                    if let Some(contained_items) = contained_array.as_array() {
-                        // Search for resource with matching id
-                        for contained_item in contained_items {
-                            if let Some(contained_obj) = contained_item.as_object() {
-                                if let Some(contained_id) = contained_obj.get("id") {
-                                    if let Some(contained_id_str) = contained_id.as_str() {
-                                        if contained_id_str == id {
-                                            // Found the contained resource - return it
-                                            let resource =
-                                                FhirResource::from_json(contained_item.clone());
-                                            return Some(FhirPathValue::Resource(resource));
-                                        }
-                                    }
-                                }
-                            }
+        if let FhirPathValue::Resource(root_res) = &context.root {
+            if let Some(root_obj) = root_res.as_json().as_object() {
+                if let Some(contained) = root_obj.get("contained").and_then(|v| v.as_array()) {
+                    for item in contained {
+                        let obj = item.as_object()?;
+                        if obj.get("id")?.as_str()? == id {
+                            return Some(FhirPathValue::Resource(FhirResource::from_json(
+                                item.clone(),
+                            )));
                         }
                     }
                 }
             }
         }
-
-        // Resource not found in contained resources
         None
     }
 
